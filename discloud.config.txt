@@ -1,0 +1,6 @@
+TYPE=bot
+MAIN=beta.py
+NAME=Discord
+RAM=500
+AUTORESTART=true
+APT=ffmpeg

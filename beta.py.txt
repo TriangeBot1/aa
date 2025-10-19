@@ -1,0 +1,349 @@
+import discord
+from discord import app_commands
+from discord.ext import commands
+import re
+import os
+import asyncio
+import yt_dlp
+import requests
+
+# --- SETUP ---
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- CONFIG ---
+PROTECTED_ROLE_IDS = [
+    1398898670769803284,  # Developer
+    1398898663111266458,  # Manager
+    1398898664247660625,  # Game Lead
+]
+
+# Supported media extensions
+SUPPORTED_EXTENSIONS = {
+    '.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac',  # Audio
+    '.mp4', '.webm', '.mov', '.mkv', '.avi', '.flv',  # Video
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'  # Images
+}
+
+# yt-dlp configuration
+YTDL_FORMAT_OPTIONS = {
+    'format': 'bestaudio/best',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0',
+}
+
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin',
+    'options': '-vn -bufsize 1024k -af volume=1.0'
+}
+
+# Initialize yt-dlp
+ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
+
+# Queue system
+music_queues = {}
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get('title')
+        self.url = data.get('url')
+        self.duration = data.get('duration')
+        self.uploader = data.get('uploader')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        
+        if 'entries' in data:
+            # Take first item from a playlist
+            data = data['entries'][0]
+
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        return cls(discord.FFmpegPCMAudio(filename, **FFMPEG_OPTIONS), data=data)
+
+@bot.event
+async def on_ready():
+    print(f"â Media Bot logged in as {bot.user}")
+    await bot.tree.sync()
+    await bot.change_presence(activity=discord.Game("Media Player | YouTube & SoundCloud"))
+
+# ---------------- /dbvc ----------------
+@bot.tree.command(name="dbvc", description="Make the bot join a voice channel by ID or link (Developer+ only).")
+@app_commands.describe(vc_input="Voice channel ID or link")
+async def dbvc(interaction: discord.Interaction, vc_input: str):
+    if not any(role.id in PROTECTED_ROLE_IDS for role in interaction.user.roles):
+        return await interaction.response.send_message("â You don't have permission.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    match = re.search(r"\d{15,20}", vc_input)
+    if not match:
+        return await interaction.followup.send("â Invalid voice channel ID or link.", ephemeral=True)
+
+    vc_id = int(match.group(0))
+    channel = interaction.guild.get_channel(vc_id)
+    if not channel or not isinstance(channel, discord.VoiceChannel):
+        return await interaction.followup.send("â Not a valid voice channel.", ephemeral=True)
+
+    if interaction.guild.voice_client:
+        await interaction.guild.voice_client.move_to(channel)
+        await interaction.followup.send(f"ð Moved to **{channel.name}**.", ephemeral=False)
+    else:
+        await channel.connect()
+        await interaction.followup.send(f"â Joined **{channel.name}**!", ephemeral=False)
+
+# ---------------- /mediaplay ----------------
+@bot.tree.command(name="mediaplay", description="Play media files, YouTube, or SoundCloud links")
+@app_commands.describe(
+    media_input="Media file, YouTube URL, or SoundCloud URL", 
+    volume="Volume level (0.1-2.0, default: 1.0)",
+    use_ffmpeg="Use FFmpeg for enhanced playback (default: True)"
+)
+async def mediaplay(interaction: discord.Interaction, media_input: str = None, volume: float = 1.0, use_ffmpeg: bool = True):
+    if not any(role.id in PROTECTED_ROLE_IDS for role in interaction.user.roles):
+        return await interaction.response.send_message("â You don't have permission.", ephemeral=True)
+
+    # Check if user is in a voice channel
+    if not interaction.user.voice:
+        return await interaction.response.send_message("â You need to be in a voice channel to use this command.", ephemeral=True)
+
+    # Validate volume
+    volume = max(0.1, min(2.0, volume))
+
+    await interaction.response.defer()
+
+    try:
+        # Get or create voice client
+        voice_client = interaction.guild.voice_client
+        if not voice_client:
+            voice_client = await interaction.user.voice.channel.connect()
+        elif voice_client.channel != interaction.user.voice.channel:
+            await voice_client.move_to(interaction.user.voice.channel)
+
+        # Stop any currently playing media
+        if voice_client.is_playing():
+            voice_client.stop()
+
+        # Check if it's a URL (YouTube or SoundCloud)
+        if media_input and (media_input.startswith(('http://', 'https://')) or 'youtube.com' in media_input or 'youtu.be' in media_input or 'soundcloud.com' in media_input):
+            # YouTube or SoundCloud URL
+            await play_from_url(interaction, voice_client, media_input, volume)
+        else:
+            # Handle as file attachment (you'll need to modify this for file uploads)
+            await interaction.followup.send("â Please provide a YouTube URL, SoundCloud URL, or upload a file.")
+
+    except Exception as e:
+        await interaction.followup.send(f"â Error playing media: {str(e)}")
+
+async def play_from_url(interaction: discord.Interaction, voice_client, url: str, volume: float):
+    try:
+        # Show searching message
+        embed = discord.Embed(
+            title="ð Searching...",
+            description=f"Looking up: `{url}`",
+            color=discord.Color.blue()
+        )
+        await interaction.followup.send(embed=embed)
+
+        # Extract info and play
+        player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
+        player.volume = volume
+
+        # Create info embed
+        duration = f"{player.duration // 60}:{player.duration % 60:02d}" if player.duration else "Unknown"
+        
+        embed = discord.Embed(
+            title="ðµ Now Playing",
+            description=f"**{player.title}**",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="ð¤ Uploader", value=player.uploader, inline=True)
+        embed.add_field(name="â±ï¸ Duration", value=duration, inline=True)
+        embed.add_field(name="ð Volume", value=f"{volume}", inline=True)
+        
+        if 'youtube' in url:
+            embed.set_thumbnail(url="https://www.youtube.com/yts/img/favicon_144-vfliLAfaB.png")
+            platform = "YouTube"
+        elif 'soundcloud' in url:
+            embed.set_thumbnail(url="https://a-v2.sndcdn.com/assets/images/sc-icons/fluid-b4e7a64b8c.png")
+            platform = "SoundCloud"
+        else:
+            platform = "Stream"
+            
+        embed.set_footer(text=f"Platform: {platform}")
+
+        voice_client.play(player, after=lambda e: print(f'Player error: {e}') if e else None)
+        await interaction.edit_original_response(embed=embed)
+
+    except Exception as e:
+        await interaction.edit_original_response(content=f"â Error playing from URL: {str(e)}")
+
+# ---------------- /play (YouTube/SoundCloud specific) ----------------
+@bot.tree.command(name="play", description="Play audio from YouTube or SoundCloud")
+@app_commands.describe(
+    url="YouTube or SoundCloud URL",
+    volume="Volume level (0.1-2.0, default: 1.0)"
+)
+async def play(interaction: discord.Interaction, url: str, volume: float = 1.0):
+    if not any(role.id in PROTECTED_ROLE_IDS for role in interaction.user.roles):
+        return await interaction.response.send_message("â You don't have permission.", ephemeral=True)
+
+    if not interaction.user.voice:
+        return await interaction.response.send_message("â You need to be in a voice channel.", ephemeral=True)
+
+    volume = max(0.1, min(2.0, volume))
+    await interaction.response.defer()
+
+    try:
+        voice_client = interaction.guild.voice_client
+        if not voice_client:
+            voice_client = await interaction.user.voice.channel.connect()
+        elif voice_client.channel != interaction.user.voice.channel:
+            await voice_client.move_to(interaction.user.voice.channel)
+
+        if voice_client.is_playing():
+            voice_client.stop()
+
+        await play_from_url(interaction, voice_client, url, volume)
+
+    except Exception as e:
+        await interaction.followup.send(f"â Error: {str(e)}")
+
+# ---------------- /queue ----------------
+@bot.tree.command(name="queue", description="Add a YouTube/SoundCloud URL to the queue")
+@app_commands.describe(url="YouTube or SoundCloud URL to add to queue")
+async def queue(interaction: discord.Interaction, url: str):
+    if not any(role.id in PROTECTED_ROLE_IDS for role in interaction.user.roles):
+        return await interaction.response.send_message("â You don't have permission.", ephemeral=True)
+
+    guild_id = interaction.guild_id
+    if guild_id not in music_queues:
+        music_queues[guild_id] = []
+
+    music_queues[guild_id].append(url)
+    
+    embed = discord.Embed(
+        title="ð¥ Added to Queue",
+        description=f"Added to position **#{len(music_queues[guild_id])}**",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="URL", value=url, inline=False)
+    await interaction.response.send_message(embed=embed)
+
+# ---------------- /skip ----------------
+@bot.tree.command(name="skip", description="Skip current track")
+async def skip(interaction: discord.Interaction):
+    if not any(role.id in PROTECTED_ROLE_IDS for role in interaction.user.roles):
+        return await interaction.response.send_message("â You don't have permission.", ephemeral=True)
+
+    voice_client = interaction.guild.voice_client
+    if not voice_client or not voice_client.is_playing():
+        return await interaction.response.send_message("â Nothing is playing.", ephemeral=True)
+
+    voice_client.stop()
+    await interaction.response.send_message("â­ï¸ Skipped current track.")
+
+# ---------------- /queue_show ----------------
+@bot.tree.command(name="queue_show", description="Show current queue")
+async def queue_show(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    queue = music_queues.get(guild_id, [])
+    
+    if not queue:
+        return await interaction.response.send_message("ð­ Queue is empty.", ephemeral=True)
+
+    embed = discord.Embed(title="ð Music Queue", color=discord.Color.gold())
+    for i, url in enumerate(queue[:10], 1):  # Show first 10 items
+        embed.add_field(name=f"#{i}", value=url[:50] + "..." if len(url) > 50 else url, inline=False)
+    
+    if len(queue) > 10:
+        embed.set_footer(text=f"And {len(queue) - 10} more tracks...")
+    
+    await interaction.response.send_message(embed=embed)
+
+# ---------------- /queue_clear ----------------
+@bot.tree.command(name="queue_clear", description="Clear the music queue")
+async def queue_clear(interaction: discord.Interaction):
+    if not any(role.id in PROTECTED_ROLE_IDS for role in interaction.user.roles):
+        return await interaction.response.send_message("â You don't have permission.", ephemeral=True)
+
+    guild_id = interaction.guild_id
+    if guild_id in music_queues:
+        music_queues[guild_id].clear()
+        await interaction.response.send_message("ðï¸ Queue cleared.")
+    else:
+        await interaction.response.send_message("ð­ Queue is already empty.")
+
+# ---------------- /mediastop ----------------
+@bot.tree.command(name="mediastop", description="Stop currently playing media")
+async def mediastop(interaction: discord.Interaction):
+    if not any(role.id in PROTECTED_ROLE_IDS for role in interaction.user.roles):
+        return await interaction.response.send_message("â You don't have permission.", ephemeral=True)
+
+    voice_client = interaction.guild.voice_client
+    if not voice_client or not voice_client.is_playing():
+        return await interaction.response.send_message("â No media is currently playing.", ephemeral=True)
+
+    voice_client.stop()
+    await interaction.response.send_message("â¹ï¸ Media playback stopped.")
+
+# ---------------- /volume ----------------
+@bot.tree.command(name="volume", description="Adjust media volume (0.1-2.0)")
+@app_commands.describe(volume_level="Volume level (0.1-2.0)")
+async def volume(interaction: discord.Interaction, volume_level: float):
+    if not any(role.id in PROTECTED_ROLE_IDS for role in interaction.user.roles):
+        return await interaction.response.send_message("â You don't have permission.", ephemeral=True)
+
+    voice_client = interaction.guild.voice_client
+    if not voice_client or not voice_client.is_playing():
+        return await interaction.response.send_message("â No media is currently playing.", ephemeral=True)
+
+    volume_level = max(0.1, min(2.0, volume_level))
+    
+    if hasattr(voice_client.source, 'volume'):
+        voice_client.source.volume = volume_level
+        await interaction.response.send_message(f"ð Volume set to **{volume_level}**")
+    else:
+        await interaction.response.send_message("â Cannot adjust volume on current media source.")
+
+# ---------------- /leave ----------------
+@bot.tree.command(name="leave", description="Make the bot leave voice channel")
+async def leave(interaction: discord.Interaction):
+    if not any(role.id in PROTECTED_ROLE_IDS for role in interaction.user.roles):
+        return await interaction.response.send_message("â You don't have permission.", ephemeral=True)
+
+    voice_client = interaction.guild.voice_client
+    if not voice_client:
+        return await interaction.response.send_message("â I'm not in a voice channel.", ephemeral=True)
+
+    # Clear queue for this guild
+    guild_id = interaction.guild_id
+    if guild_id in music_queues:
+        music_queues[guild_id].clear()
+
+    await voice_client.disconnect()
+    await interaction.response.send_message("ð Left the voice channel.")
+
+# ---------------- Error Handling ----------------
+@play.error
+async def play_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        await interaction.response.send_message("â You don't have permission to use this command.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"â An error occurred: {str(error)}", ephemeral=True)
+
+# ---------------- RUN ----------------
+# Replace with your second bot token
+bot.run("MTQyOTUwOTk3NDk5MTgzNTE1OA.Gd6GmA.W1D4wOuMoenaRz6wlP5GWTdOrED4IjNbD0LSBk")
